@@ -112,6 +112,43 @@ function App() {
 
   const subscribeToProgress = (jobId: string, subscribeUrl: string) => {
     const eventSource = new EventSource(`${API_URL}${subscribeUrl}`);
+    
+    // Handle connection open
+    eventSource.onopen = () => {
+      console.log('SSE connection opened for job:', jobId);
+    };
+
+    // Polling fallback - check status every 2 seconds
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_URL}/v1/download/status/${jobId}`);
+        if (response.ok) {
+          const data = await response.json();
+          setCurrentJob({
+            jobId: data.jobId,
+            status: data.status,
+            progress: data.progress,
+            filesCompleted: data.filesCompleted,
+            totalFiles: data.totalFiles,
+            downloadUrl: data.downloadUrl,
+          });
+          
+          // If completed, redirect and stop polling
+          if (data.status === 'completed' && data.downloadUrl) {
+            clearInterval(pollInterval);
+            eventSource.close();
+            setTimeout(() => {
+              window.location.href = data.downloadUrl;
+            }, 500);
+          } else if (data.status === 'failed') {
+            clearInterval(pollInterval);
+            eventSource.close();
+          }
+        }
+      } catch (error) {
+        console.error('Error polling job status:', error);
+      }
+    }, 2000);
 
     eventSource.addEventListener('progress', (event: MessageEvent) => {
       const data = JSON.parse(event.data);
@@ -125,8 +162,10 @@ function App() {
       };
       setCurrentJob(updatedJob);
       
-      // Also check if status changed to completed via progress event (fallback)
+      // Check if status changed to completed via progress event
       if (data.status === 'completed' && data.downloadUrl) {
+        clearInterval(pollInterval);
+        eventSource.close();
         setTimeout(() => {
           window.location.href = data.downloadUrl;
         }, 500);
@@ -143,21 +182,34 @@ function App() {
         totalFiles: data.totalFiles,
         downloadUrl: data.downloadUrl,
       });
+      clearInterval(pollInterval);
       eventSource.close();
       
       // Automatically redirect to presigned URL to start download
       if (data.downloadUrl) {
-        // Use a small delay to ensure UI updates, then redirect
         setTimeout(() => {
           window.location.href = data.downloadUrl;
         }, 500);
       }
     });
 
-    eventSource.addEventListener('error', (event: MessageEvent | Event) => {
-      // Handle both MessageEvent (with data) and generic Event (connection errors)
-      if ('data' in event && event.data) {
+    // Handle connection errors (not SSE error events)
+    eventSource.onerror = (error) => {
+      console.error('SSE connection error:', error);
+      // Only show error if connection is actually closed (readyState === 2)
+      if (eventSource.readyState === EventSource.CLOSED) {
+        // Check if job is still processing - if so, it might be a temporary connection issue
+        // Don't immediately fail, let polling handle it
+        console.warn('SSE connection closed. Job may still be processing.');
+      }
+      // Don't close the connection on error - EventSource will try to reconnect
+    };
+    
+    // Handle SSE error events (from server)
+    eventSource.addEventListener('error', (event: MessageEvent) => {
+      try {
         const data = JSON.parse(event.data);
+        clearInterval(pollInterval);
         setCurrentJob({
           jobId: data.jobId || jobId,
           status: 'failed',
@@ -166,22 +218,15 @@ function App() {
           totalFiles: 0,
           error: data.error || 'Download failed',
         });
-      } else {
-        // Connection error
-        setCurrentJob({
-          jobId: jobId,
-          status: 'failed',
-          progress: 0,
-          filesCompleted: 0,
-          totalFiles: 0,
-          error: 'Connection error',
-        });
+        eventSource.close();
+      } catch (e) {
+        console.error('Error parsing SSE error event:', e);
       }
-      eventSource.close();
     });
 
     // Cleanup on unmount
     return () => {
+      clearInterval(pollInterval);
       eventSource.close();
     };
   };
